@@ -33,13 +33,34 @@ python3 -m venv .venv
 `run/lake/manifest.json` 保存源文件哈希、schema 版本和业务汇总；Parquet 可用 DuckDB 单独查询。
 同一个输出目录重复运行返回非零，保护已有快照；改新目录应得到一致业务值。
 
+## 增量修订（v2）
+
+已发布快照保持不变；把一份有序补丁应用到父快照（v1 全量快照或已有的 v2 快照），
+在不存在的新目录中生成完整、自包含的 v2 快照：
+
+```sh
+.venv/bin/python -m meter_lake.incremental \
+  --base run/lake \
+  --changes data/patches/01-revise-history.csv \
+  --output run/lake-v2
+.venv/bin/python -m meter_lake.query run/lake-v2/warehouse.duckdb
+```
+
+Python 调用：`from meter_lake.incremental import revise`，
+签名为 `revise(base, changes_path, output)`。补丁契约、依赖闭包、v2 分层与失败
+重跑语义见 `docs/incremental-v2.md`。合成补丁示例位于 `data/patches/`，包括
+仅表头补丁、补报小时、等值 replace 与删除。增量构建只撤销并重算变化边界邻接
+闭包内的区间与受影响站点日，不调用全量 build，也不重跑全表 lag 差分。
+
 ## 文件与语义
 
 - `meter_lake/ingest.py`：CSV、维表和时间边界契约。
 - `meter_lake/transform.sql`：lag 差分、维度关联与日汇总。
 - `meter_lake/pipeline.py`：分层构建、业务校验、Parquet 和 manifest。
+- `meter_lake/patch.py`：补丁解析、整批前置校验、最终计量约束与依赖闭包。
+- `meter_lake/incremental/`：v2 增量修订引擎（`revise`）与 `python -m meter_lake.incremental` 入口。
 - `meter_lake/query.py`：只读查询已构建数据库。
-- `data/`：自制数据和来源说明；`tests/`：计量语义、重复运行和失败测试。
+- `data/`：自制数据和来源说明；`data/patches/`：合成补丁示例；`tests/`：计量语义、重复运行和失败测试。
 
 源数据错误（未知表、重复时间、缺小时、读数回退、超过容量）拒绝整个批次，输出目录不发布。
 基线是单写者全量构建；没有实现流处理、分区增量或 Schema 演进。

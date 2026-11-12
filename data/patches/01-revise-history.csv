@@ -1,0 +1,2 @@
+op,meter_id,observed_at,register_wh,expected_wh
+replace,M-A,2026-01-01T01:00:00Z,2500,2200

@@ -23,6 +23,10 @@ Layers:
 
 Full-batch snapshots only, one writer, fresh output directory. Failed validation
 leaves no output snapshot; an existing output is refused. There is no mutable
-latest pointer, partition pruning, schema migration, streaming checkpoint,
-incremental merge, or concurrent publisher protocol. Parquet files and database
-must be kept together with their manifest when exchanging a snapshot.
+latest pointer, partition pruning, schema migration, streaming checkpoint, or
+concurrent publisher protocol. Parquet files and database must be kept together
+with their manifest when exchanging a snapshot.
+
+Revision of an already published snapshot is a separate v2 contract built from
+an explicit change patch; see `incremental-v2.md`.  It never mutates a v1
+snapshot and reuses the same four physical tables and Parquet layer names.
