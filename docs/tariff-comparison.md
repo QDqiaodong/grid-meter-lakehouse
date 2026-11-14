@@ -98,6 +98,32 @@ All components are computed exactly with `Decimal` from the snapshot's
 `ROUND_HALF_UP`, to fen; `total_yuan_rounded` and `total_fen` carry that
 rounded value while `total_yuan` keeps the exact unrounded amount.
 
+### Numeric environment
+
+Every decimal operation in `load_tariff`, `compare_month` and the report
+chain runs inside a private decimal context
+(`meter_lake.tariff.model.numeric_context`): 100 significant digits,
+`ROUND_HALF_UP`, default exponent limits and **no signal traps**.  The
+caller's `decimal` context is copied and restored around the whole call, so:
+
+- caller precision, rounding mode, enabled traps (`Inexact`, `Rounded`, …)
+  and pre-set sticky flags can neither distort the report bytes nor turn a
+  legal snapshot into an error, and
+- the caller's context — including its flags and trap enablements — is left
+  byte-for-byte unchanged whether the comparison succeeds or fails.  Nothing
+  is written to the global decimal configuration and no error is swallowed.
+
+Exactness budget: hourly facts carry at most 24 significant digits
+(`DECIMAL(24,6)`); tariff prices, fees and thresholds carry at most 6
+fractional digits with integer parts bounded at 10^12 (10^15 for
+thresholds).  A full month sums at most 744 × meters facts and each product
+`kwh × price` adds at most 6 fractional digits, so every intermediate stays
+below 50 significant digits — comfortably inside the 100-digit private
+precision, which means intermediates are never rounded at all.  The single
+sanctioned rounding is the final `quantize(0.01, ROUND_HALF_UP)` of the
+total; `total_fen` is derived from that quantized value by digit-tuple
+conversion, not by context arithmetic.
+
 Plans are sorted by the **unrounded** total and then by `tariff_id`; equal
 unrounded totals share the same rank (competition ranking, e.g. `1, 1, 3`).
 Rounded cents never decide the order.

@@ -4,10 +4,15 @@ All money math uses :class:`decimal.Decimal`.  Hourly energy comes from the
 snapshot's ``DECIMAL(24,6)`` facts, so every component stays exact; only the
 final total is rounded (HALF_UP) to cents.  Snapshot files are opened
 read-only and never modified.
+
+Every decimal operation happens inside :func:`meter_lake.tariff.model.numeric_context`,
+a private high-precision, trap-free context: the caller's precision, rounding
+mode, flags and trap enablements never influence the result, and are restored
+unchanged whether the comparison succeeds or fails.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
 from pathlib import Path
@@ -22,6 +27,7 @@ from .model import (
     decimal_text,
     fixed_text,
     load_tariff,
+    numeric_context,
 )
 
 REPORT_SCHEMA = "meter-lake-site-month-tariff-v1"
@@ -30,6 +36,25 @@ MONTH_RE = re.compile(r"^([0-9]{4})-(0[1-9]|1[0-2])$")
 STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 SUPPORTED = {(1, "full-batch"), (2, "incremental")}
 TABLES = {"meters", "interval_usage"}
+
+
+def _to_fen(rounded_yuan):
+    """Convert a cent-quantized yuan Decimal to an integer fen count.
+
+    The arithmetic is performed on the decimal's sign/digits/exponent tuple
+    rather than through an operator, so the result is independent of the
+    active context's precision and traps (a two-significant-digit caller
+    context would otherwise round ``86.70 * 100`` or raise on the
+    multiplication).  The input is guaranteed quantized to cents upstream.
+    """
+    sign, digits, exponent = rounded_yuan.as_tuple()
+    if exponent < -2:
+        raise ValueError("total must be quantized to whole fen before conversion")
+    integer = 0
+    for digit in digits:
+        integer = integer * 10 + digit
+    integer *= 10 ** (exponent + 2)
+    return -integer if sign else integer
 
 
 class MonthError(ValueError):
@@ -251,55 +276,57 @@ def _segment_prices(tariff):
 
 
 def _tier_allocation(tariff, total_kwh):
+    # Runs inside the private numeric context opened by compare_month.
     rows = []
     surcharge = Decimal(0)
-    with localcontext() as context:
-        context.prec = 100
-        for index, tier in enumerate(tariff.tiers):
-            if index + 1 < len(tariff.tiers):
-                upper = tariff.tiers[index + 1].threshold
-                quantity = max(Decimal(0), min(total_kwh, upper) - tier.threshold)
-            else:
-                quantity = max(Decimal(0), total_kwh - tier.threshold)
-            amount = quantity * tier.price
-            surcharge += amount
-            rows.append({
-                "tier_id": tier.tier_id,
-                "threshold_kwh": decimal_text(tier.threshold),
-                "price_per_kwh": decimal_text(tier.price),
-                "kwh": fixed_text(quantity, 6),
-                "surcharge_yuan": decimal_text(amount),
-            })
+    for index, tier in enumerate(tariff.tiers):
+        if index + 1 < len(tariff.tiers):
+            upper = tariff.tiers[index + 1].threshold
+            quantity = max(Decimal(0), min(total_kwh, upper) - tier.threshold)
+        else:
+            quantity = max(Decimal(0), total_kwh - tier.threshold)
+        amount = quantity * tier.price
+        surcharge += amount
+        rows.append({
+            "tier_id": tier.tier_id,
+            "threshold_kwh": decimal_text(tier.threshold),
+            "price_per_kwh": decimal_text(tier.price),
+            "kwh": fixed_text(quantity, 6),
+            "surcharge_yuan": decimal_text(amount),
+        })
     return surcharge, rows
 
 
 def _price(tariff, total_kwh, peak_kwh, basis):
-    """Return the exact comparison block for one tariff."""
+    """Return the exact comparison block for one tariff.
+
+    All arithmetic stays in the private numeric context; the only rounding is
+    the final cent quantize of the total, performed with an explicit
+    ROUND_HALF_UP so the caller's rounding mode cannot change the report.
+    """
     segment_of = _segment_prices(tariff)
-    with localcontext() as context:
-        context.prec = 100
-        energy = Decimal(0)
-        meters = []
-        for meter in sorted(basis):
-            hours = []
-            for instant, kwh in basis[meter]:
-                segment = segment_of[instant.hour]
-                amount = kwh * segment.price
-                energy += amount
-                hours.append({
-                    "interval_start": stamp(instant),
-                    "interval_end": stamp(instant + timedelta(hours=1)),
-                    "kwh": fixed_text(kwh, 6),
-                    "segment_id": segment.segment_id,
-                    "price_per_kwh": decimal_text(segment.price),
-                    "energy_yuan": decimal_text(amount),
-                })
-            meters.append({"meter_id": meter, "hours": hours})
-        surcharge, allocation = _tier_allocation(tariff, total_kwh)
-        demand = peak_kwh * tariff.demand_price
-        fixed_fee = tariff.fixed_fee
-        total = energy + surcharge + demand + fixed_fee
-        rounded = total.quantize(CENT, rounding=ROUND_HALF_UP)
+    energy = Decimal(0)
+    meters = []
+    for meter in sorted(basis):
+        hours = []
+        for instant, kwh in basis[meter]:
+            segment = segment_of[instant.hour]
+            amount = kwh * segment.price
+            energy += amount
+            hours.append({
+                "interval_start": stamp(instant),
+                "interval_end": stamp(instant + timedelta(hours=1)),
+                "kwh": fixed_text(kwh, 6),
+                "segment_id": segment.segment_id,
+                "price_per_kwh": decimal_text(segment.price),
+                "energy_yuan": decimal_text(amount),
+            })
+        meters.append({"meter_id": meter, "hours": hours})
+    surcharge, allocation = _tier_allocation(tariff, total_kwh)
+    demand = peak_kwh * tariff.demand_price
+    fixed_fee = tariff.fixed_fee
+    total = energy + surcharge + demand + fixed_fee
+    rounded = total.quantize(CENT, rounding=ROUND_HALF_UP)
     return {
         "tariff_id": tariff.tariff_id,
         "components": {
@@ -309,7 +336,7 @@ def _price(tariff, total_kwh, peak_kwh, basis):
             "fixed_fee_yuan": decimal_text(fixed_fee),
             "total_yuan": decimal_text(total),
             "total_yuan_rounded": format(rounded, "f"),
-            "total_fen": int((rounded * 100).to_integral_value()),
+            "total_fen": _to_fen(rounded),
         },
         "tier_allocation": allocation,
         "meters": meters,
@@ -335,99 +362,105 @@ def compare_month(snapshot, month, site, tariff_paths):
 
     ``month`` is ``YYYY-MM``; ``site`` must exist in the snapshot dimension;
     ``tariff_paths`` is a nonempty iterable of strict JSON tariff files.
+
+    The whole comparison — tariff loading, fact aggregation, formatting,
+    pricing and ranking — runs inside
+    :func:`meter_lake.tariff.model.numeric_context`.  The caller's decimal
+    context (precision, rounding, flags, traps) therefore cannot change the
+    report bytes or turn a legal snapshot into an error, and is restored
+    unchanged on both success and failure.
     """
-    month = parse_month(month)
-    if not isinstance(site, str) or site.strip() == "":
-        raise MonthError("site must be a nonempty string")
-    paths = [Path(path) for path in tariff_paths]
-    if not paths:
-        raise TariffError("at least one tariff file is required")
-    tariffs = [load_tariff(path) for path in paths]
-    identifiers = [tariff.tariff_id for tariff in tariffs]
-    if len(identifiers) != len(set(identifiers)):
-        raise TariffError("tariff_id values must be unique across the comparison")
-    source, members, facts, expected, gaps = _collect(snapshot, month, site)
+    with numeric_context():
+        month = parse_month(month)
+        if not isinstance(site, str) or site.strip() == "":
+            raise MonthError("site must be a nonempty string")
+        paths = [Path(path) for path in tariff_paths]
+        if not paths:
+            raise TariffError("at least one tariff file is required")
+        tariffs = [load_tariff(path) for path in paths]
+        identifiers = [tariff.tariff_id for tariff in tariffs]
+        if len(identifiers) != len(set(identifiers)):
+            raise TariffError("tariff_id values must be unique across the comparison")
+        source, members, facts, expected, gaps = _collect(snapshot, month, site)
 
-    tariff_docs = sorted((tariff.document() for tariff in tariffs),
-                         key=lambda doc: doc["tariff_id"])
-    source_summary = {
-        "snapshot": {
-            "manifest_sha256": source["manifest_sha256"],
-            "warehouse_sha256": source["warehouse_sha256"],
-            "schema_version": source["schema_version"],
-            "mode": source["mode"],
-            "timezone": source["timezone"],
-        },
-        "meters": members,
-        "tariffs": sorted(
-            ({"file": path.name, "tariff_id": tariff.tariff_id,
-              "sha256": tariff.input_sha256}
-             for path, tariff in zip(paths, tariffs)),
-            key=lambda item: (item["tariff_id"], item["file"]),
-        ),
-    }
-    report = {
-        "report_schema": REPORT_SCHEMA,
-        "currency": "CNY",
-        "month": {"utc": month.label, "start": stamp(month.start), "end": stamp(month.end)},
-        "site": site,
-        "comparable": not gaps,
-        "meters": members,
-        "hours_per_meter": month.hours,
-        "gaps": gaps,
-        "tariffs": tariff_docs,
-        "source": source_summary,
-    }
-    if gaps:
-        # A missing hour makes the coincident site peak unknowable; pricing and
-        # ranking are intentionally withheld rather than computed on partial data.
-        report["hourly_basis"] = []
-        report["peak"] = None
-        report["site_month"] = None
-        report["comparison"] = []
-        return report
+        tariff_docs = sorted((tariff.document() for tariff in tariffs),
+                             key=lambda doc: doc["tariff_id"])
+        source_summary = {
+            "snapshot": {
+                "manifest_sha256": source["manifest_sha256"],
+                "warehouse_sha256": source["warehouse_sha256"],
+                "schema_version": source["schema_version"],
+                "mode": source["mode"],
+                "timezone": source["timezone"],
+            },
+            "meters": members,
+            "tariffs": sorted(
+                ({"file": path.name, "tariff_id": tariff.tariff_id,
+                  "sha256": tariff.input_sha256}
+                 for path, tariff in zip(paths, tariffs)),
+                key=lambda item: (item["tariff_id"], item["file"]),
+            ),
+        }
+        report = {
+            "report_schema": REPORT_SCHEMA,
+            "currency": "CNY",
+            "month": {"utc": month.label, "start": stamp(month.start), "end": stamp(month.end)},
+            "site": site,
+            "comparable": not gaps,
+            "meters": members,
+            "hours_per_meter": month.hours,
+            "gaps": gaps,
+            "tariffs": tariff_docs,
+            "source": source_summary,
+        }
+        if gaps:
+            # A missing hour makes the coincident site peak unknowable; pricing and
+            # ranking are intentionally withheld rather than computed on partial data.
+            report["hourly_basis"] = []
+            report["peak"] = None
+            report["site_month"] = None
+            report["comparison"] = []
+            return report
 
-    basis = {}
-    for meter in members:
-        basis[meter] = [(instant, facts[(meter, instant)]) for instant in expected]
-    hourly_basis = []
-    site_hourly = {}
-    for instant in expected:
-        total = sum((facts[(meter, instant)] for meter in members), Decimal(0))
-        site_hourly[instant] = total
+        basis = {}
         for meter in members:
-            hourly_basis.append({
-                "meter_id": meter,
-                "interval_start": stamp(instant),
-                "interval_end": stamp(instant + timedelta(hours=1)),
-                "kwh": fixed_text(facts[(meter, instant)], 6),
-                "site_hour_kwh": fixed_text(total, 6),
-            })
-    peak_value = max(site_hourly.values())
-    peak_hours = [
-        {"interval_start": stamp(instant), "site_kwh": fixed_text(site_hourly[instant], 6)}
-        for instant in expected if site_hourly[instant] == peak_value
-    ]
-    with localcontext() as context:
-        context.prec = 100
+            basis[meter] = [(instant, facts[(meter, instant)]) for instant in expected]
+        hourly_basis = []
+        site_hourly = {}
+        for instant in expected:
+            total = sum((facts[(meter, instant)] for meter in members), Decimal(0))
+            site_hourly[instant] = total
+            for meter in members:
+                hourly_basis.append({
+                    "meter_id": meter,
+                    "interval_start": stamp(instant),
+                    "interval_end": stamp(instant + timedelta(hours=1)),
+                    "kwh": fixed_text(facts[(meter, instant)], 6),
+                    "site_hour_kwh": fixed_text(total, 6),
+                })
+        peak_value = max(site_hourly.values())
+        peak_hours = [
+            {"interval_start": stamp(instant), "site_kwh": fixed_text(site_hourly[instant], 6)}
+            for instant in expected if site_hourly[instant] == peak_value
+        ]
         total_kwh = sum(site_hourly.values(), Decimal(0))
-    blocks = []
-    for tariff in tariffs:
-        blocks.append(_price(tariff, total_kwh, peak_value, basis))
-    report.update({
-        "hourly_basis": hourly_basis,
-        "peak": {
-            "hourly_site_kwh": fixed_text(peak_value, 6),
-            "hours": peak_hours,
-        },
-        "site_month": {
-            "total_kwh": fixed_text(total_kwh, 6),
-            "meter_count": len(members),
-            "hour_count": month.hours,
-        },
-        "comparison": _rank(blocks),
-    })
-    return report
+        blocks = []
+        for tariff in tariffs:
+            blocks.append(_price(tariff, total_kwh, peak_value, basis))
+        report.update({
+            "hourly_basis": hourly_basis,
+            "peak": {
+                "hourly_site_kwh": fixed_text(peak_value, 6),
+                "hours": peak_hours,
+            },
+            "site_month": {
+                "total_kwh": fixed_text(total_kwh, 6),
+                "meter_count": len(members),
+                "hour_count": month.hours,
+            },
+            "comparison": _rank(blocks),
+        })
+        return report
 
 
 def render_report(report):
