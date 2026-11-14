@@ -22,7 +22,12 @@ Layers:
 - warehouse.duckdb: same four physical SQL tables, self-contained after moving.
 
 Full-batch snapshots only, one writer, fresh output directory. Failed validation
-leaves no output snapshot; an existing output is refused. There is no mutable
+leaves no output snapshot; an existing output is refused. Inputs are staged to
+bronze first; validation, bounded-batch ingestion (`batch_rows` readings per
+insert, default 10000) and manifest hashes all read those same staged bytes.
+Python holds only the meter dimension and at most two reading batches; reading
+key uniqueness (including UTC-equivalent instants across batches) is enforced
+by the readings primary key inside DuckDB. There is no mutable
 latest pointer, partition pruning, schema migration, streaming checkpoint, or
 concurrent publisher protocol. Parquet files and database must be kept together
 with their manifest when exchanging a snapshot.

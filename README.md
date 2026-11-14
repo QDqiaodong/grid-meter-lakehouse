@@ -33,6 +33,18 @@ python3 -m venv .venv
 `run/lake/manifest.json` 保存源文件哈希、schema 版本和业务汇总；Parquet 可用 DuckDB 单独查询。
 同一个输出目录重复运行返回非零，保护已有快照；改新目录应得到一致业务值。
 
+## 流式全量构建
+
+全量构建不再把读数整体载入 Python：原始 CSV 先落到暂存 bronze，校验、分批入库
+（`--batch-rows`，默认 10000，必须为正整数）与 manifest 哈希都作用于同一份暂存字节。
+Python 只保留维表和最多两个批次；重复键（含跨批次的 UTC 等价时刻）由 readings 主键
+在 DuckDB 内拒绝。任一批次坏行或导出失败都不会发布输出，暂存目录自动清理。
+
+```sh
+.venv/bin/python -m meter_lake --output run/lake --batch-rows 5000
+.venv/bin/python scripts/bench_streaming.py   # 10 倍行数差的分批内存基准
+```
+
 ## 增量修订（v2）
 
 已发布快照保持不变；把一份有序补丁应用到父快照（v1 全量快照或已有的 v2 快照），
@@ -78,9 +90,9 @@ ROUND_HALF_UP 到分，排名按未舍入总额和套餐 ID。月内本站每台
 
 ## 文件与语义
 
-- `meter_lake/ingest.py`：CSV、维表和时间边界契约。
+- `meter_lake/ingest.py`：CSV、维表契约和读数分批流式校验。
 - `meter_lake/transform.sql`：lag 差分、维度关联与日汇总。
-- `meter_lake/pipeline.py`：分层构建、业务校验、Parquet 和 manifest。
+- `meter_lake/pipeline.py`：分批入库、分层构建、业务校验、Parquet 和 manifest。
 - `meter_lake/patch.py`：补丁解析、整批前置校验、最终计量约束与依赖闭包。
 - `meter_lake/incremental/`：v2 增量修订引擎（`revise`）与 `python -m meter_lake.incremental` 入口。
 - `meter_lake/query.py`：只读查询已构建数据库。
