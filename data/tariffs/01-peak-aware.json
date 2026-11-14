@@ -1,0 +1,16 @@
+{
+  "tariff_id": "PEAK-AWARE",
+  "segments": [
+    {"id": "night", "start_hour": 0, "end_hour": 8, "price_per_kwh": "0.30"},
+    {"id": "morning-peak", "start_hour": 8, "end_hour": 12, "price_per_kwh": "0.90"},
+    {"id": "afternoon", "start_hour": 12, "end_hour": 18, "price_per_kwh": "0.60"},
+    {"id": "evening", "start_hour": 18, "end_hour": 24, "price_per_kwh": "0.80"}
+  ],
+  "tiers": [
+    {"id": "base", "threshold_kwh": "0", "price_per_kwh": "0.10"},
+    {"id": "mid", "threshold_kwh": "50", "price_per_kwh": "0.20"},
+    {"id": "high", "threshold_kwh": "150", "price_per_kwh": "0.30"}
+  ],
+  "demand_price_per_kw": "1.50",
+  "fixed_fee": "30.00"
+}

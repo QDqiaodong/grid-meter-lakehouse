@@ -1,0 +1,13 @@
+{
+  "tariff_id": "FLAT-SAVER",
+  "segments": [
+    {"id": "flat", "start_hour": 0, "end_hour": 24, "price_per_kwh": "0.55"}
+  ],
+  "tiers": [
+    {"id": "base", "threshold_kwh": "0", "price_per_kwh": "0.05"},
+    {"id": "mid", "threshold_kwh": "100", "price_per_kwh": "0.15"},
+    {"id": "high", "threshold_kwh": "300", "price_per_kwh": "0.25"}
+  ],
+  "demand_price_per_kw": "2.00",
+  "fixed_fee": "18.00"
+}
